@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: bus86
+    runtime: python
+
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: gunicorn app:app
+
+    envVars:
+      - key: PAGE_ID
+        value: mon-id
+
+      - key: PYTHON_VERSION
+        value: 3.13.5
