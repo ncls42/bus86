@@ -29,7 +29,7 @@ TIMEZONE = ZoneInfo("Europe/Paris")
 
 # Si aucun bus n'est trouvé, on attend 60 secondes
 # avant de refaire une requête API.
-INTERVALLE_SANS_BUS = 60
+INTERVALLE_SANS_BUS = 65
 
 # Une fois un bus trouvé, son résultat reste valable
 # jusqu'à 3 minutes après son heure d'arrivée théorique.
@@ -63,6 +63,8 @@ cache = {
 }
 
 cache_lock = threading.Lock()
+# Nombre total d'appels réels à l'API TCL
+nombre_appels_api = 0
 
 
 # ============================================================
@@ -116,6 +118,10 @@ arrets = charger_arrets()
 # ============================================================
 
 def recuperer_bus():
+
+    global nombre_appels_api
+
+    nombre_appels_api += 1
 
     try:
 
@@ -538,3 +544,97 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000))
     )
+
+@app.route("/callapi")
+def callapi():
+
+    return f"""
+    <!DOCTYPE html>
+
+    <html lang="fr">
+
+    <head>
+        <meta charset="UTF-8">
+
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0"
+        >
+
+        <title>API TCL - Statistiques</title>
+
+        <style>
+
+            * {{
+                box-sizing: border-box;
+            }}
+
+            html,
+            body {{
+                margin: 0;
+                padding: 0;
+                width: 100%;
+                height: 100%;
+            }}
+
+            body {{
+                background: #202124;
+                color: white;
+                font-family: Arial, sans-serif;
+
+                display: flex;
+                align-items: center;
+                justify-content: center;
+
+                text-align: center;
+            }}
+
+            .conteneur {{
+                padding: 30px;
+            }}
+
+            .titre {{
+                font-size: 22px;
+                color: #999999;
+                margin-bottom: 20px;
+            }}
+
+            .nombre {{
+                font-size: 80px;
+                line-height: 1;
+                font-weight: bold;
+                color: #55dd88;
+            }}
+
+            .texte {{
+                font-size: 18px;
+                margin-top: 15px;
+                color: #ffffff;
+            }}
+
+        </style>
+
+    </head>
+
+    <body>
+
+        <div class="conteneur">
+
+            <div class="titre">
+                API TCL
+            </div>
+
+            <div class="nombre">
+                {nombre_appels_api}
+            </div>
+
+            <div class="texte">
+                appels effectués
+            </div>
+
+        </div>
+
+    </body>
+
+    </html>
+    """
