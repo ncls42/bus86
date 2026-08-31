@@ -1,11 +1,12 @@
 import csv
 import os
-import threading
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, abort
+import redis
+from flask import Flask, jsonify
 
 
 # ============================================================
@@ -24,46 +25,63 @@ CSV_FILE = "ligne_86_arrets.csv"
 
 DESTINATION = "Campus Région numérique"
 
-# Fuseau horaire français
 TIMEZONE = ZoneInfo("Europe/Paris")
-
-# Si aucun bus n'est trouvé, on attend 60 secondes
-# avant de refaire une requête API.
-INTERVALLE_SANS_BUS = 65
-
-# Une fois un bus trouvé, son résultat reste valable
-# jusqu'à 3 minutes après son heure d'arrivée théorique.
-MARGE_CACHE_APRES_ARRIVEE = 3
-
-
-# ============================================================
-# IDENTIFIANT DE LA PAGE
-# ============================================================
-
-# Dans Render, on pourra mettre :
-#
-# PAGE_ID = mon-id
-#
-# L'adresse sera alors :
-#
-# https://ton-projet.onrender.com/mon-id/
-#
-PAGE_ID = os.environ.get("PAGE_ID", "mon-id")
 
 
 # ============================================================
 # CACHE
 # ============================================================
 
-cache = {
-    "heure": None,
-    "bus": None,
-    "expiration": None,
-    "prochaine_requete": None,
-}
+# Si aucun bus n'est trouvé :
+# on ne demande pas immédiatement une nouvelle fois à TCL.
+INTERVALLE_SANS_BUS = 65
 
-cache_lock = threading.Lock()
-# Nombre total d'appels réels à l'API TCL
+# Le résultat d'un bus reste valable 3 minutes
+# après son heure théorique d'arrivée.
+MARGE_CACHE_APRES_ARRIVEE = 3
+
+
+# ------------------------------------------------------------
+# Redis
+# ------------------------------------------------------------
+
+REDIS_URL = os.environ.get("REDIS_URL")
+
+if not REDIS_URL:
+    raise RuntimeError(
+        "La variable d'environnement REDIS_URL n'est pas configurée."
+    )
+
+redis_client = redis.from_url(
+    REDIS_URL,
+    decode_responses=True
+)
+
+
+# Clé Redis contenant le résultat calculé
+CACHE_KEY = "tcl:ligne86:campus"
+
+# Verrou Redis empêchant plusieurs workers
+# d'interroger TCL simultanément.
+LOCK_KEY = "tcl:ligne86:lock"
+
+# Durée maximale du verrou.
+LOCK_TIMEOUT = 15
+
+
+# ============================================================
+# IDENTIFIANT DE LA PAGE
+# ============================================================
+
+PAGE_ID = os.environ.get("PAGE_ID", "mon-id")
+
+
+# ============================================================
+# STATISTIQUES
+# ============================================================
+
+# Ce compteur est volontairement en mémoire.
+# Il sert uniquement aux statistiques du worker courant.
 nombre_appels_api = 0
 
 
@@ -151,7 +169,7 @@ def rechercher_bus():
 
     bus_api = recuperer_bus()
 
-    # None signifie que l'API a rencontré une erreur.
+    # None = erreur API
     if bus_api is None:
         return None
 
@@ -171,7 +189,7 @@ def rechercher_bus():
             continue
 
         # ----------------------------------------------------
-        # L'arrêt doit être dans notre CSV
+        # Arrêt connu dans notre CSV
         # ----------------------------------------------------
 
         if prev_stop not in arrets:
@@ -206,10 +224,12 @@ def rechercher_bus():
 
 
 # ============================================================
-# MISE A JOUR DU CACHE
+# CALCUL DU RESULTAT
 # ============================================================
 
-def mettre_a_jour_cache(maintenant):
+def construire_resultat():
+
+    maintenant = datetime.now(TIMEZONE)
 
     bus = rechercher_bus()
 
@@ -218,25 +238,7 @@ def mettre_a_jour_cache(maintenant):
     # --------------------------------------------------------
 
     if bus is None:
-
-        # On ne détruit pas forcément un résultat précédent
-        # en cas d'erreur temporaire de l'API.
-        #
-        # Si un ancien résultat existe encore, on le conserve.
-        if (
-            cache["heure"] is not None
-            and cache["expiration"] is not None
-            and maintenant < cache["expiration"]
-        ):
-            return cache
-
-        # Sinon, nouvelle tentative dans 60 secondes.
-        cache["prochaine_requete"] = (
-            maintenant
-            + timedelta(seconds=INTERVALLE_SANS_BUS)
-        )
-
-        return cache
+        return None
 
     # --------------------------------------------------------
     # AUCUN BUS
@@ -244,16 +246,15 @@ def mettre_a_jour_cache(maintenant):
 
     if not bus:
 
-        cache["heure"] = None
-        cache["bus"] = []
-        cache["expiration"] = None
-
-        cache["prochaine_requete"] = (
-            maintenant
-            + timedelta(seconds=INTERVALLE_SANS_BUS)
-        )
-
-        return cache
+        return {
+            "etat": "aucun_bus",
+            "heure": None,
+            "bus": [],
+            "expiration": (
+                maintenant
+                + timedelta(seconds=INTERVALLE_SANS_BUS)
+            ).isoformat()
+        }
 
     # --------------------------------------------------------
     # BUS TROUVE
@@ -263,27 +264,75 @@ def mettre_a_jour_cache(maintenant):
 
     minutes = premier_bus["temps"]
 
-    # Heure théorique d'arrivée
     heure_arrivee = maintenant + timedelta(
         minutes=minutes
     )
 
-    # On garde le résultat jusqu'à 3 minutes
-    # après l'heure théorique.
     expiration = (
         heure_arrivee
         + timedelta(minutes=MARGE_CACHE_APRES_ARRIVEE)
     )
 
-    cache["heure"] = heure_arrivee
-    cache["bus"] = bus
-    cache["expiration"] = expiration
+    return {
+        "etat": "bus",
+        "heure": heure_arrivee.isoformat(),
+        "bus": bus,
+        "expiration": expiration.isoformat()
+    }
 
-    # Pas de nouvelle requête programmée :
-    # le cache est valable jusqu'à expiration.
-    cache["prochaine_requete"] = None
 
-    return cache
+# ============================================================
+# RECUPERATION DU CACHE REDIS
+# ============================================================
+
+def lire_cache():
+
+    valeur = redis_client.get(CACHE_KEY)
+
+    if not valeur:
+        return None
+
+    try:
+        import json
+        return json.loads(valeur)
+
+    except Exception as e:
+
+        print("Erreur lecture cache Redis :", e)
+
+        return None
+
+
+# ============================================================
+# ECRITURE DU CACHE REDIS
+# ============================================================
+
+def ecrire_cache(resultat):
+
+    import json
+
+    maintenant = datetime.now(TIMEZONE)
+
+    expiration = datetime.fromisoformat(
+        resultat["expiration"]
+    )
+
+    # --------------------------------------------------------
+    # TTL Redis
+    # --------------------------------------------------------
+
+    ttl = int(
+        (expiration - maintenant).total_seconds()
+    )
+
+    # Sécurité
+    ttl = max(ttl, 1)
+
+    redis_client.setex(
+        CACHE_KEY,
+        ttl,
+        json.dumps(resultat)
+    )
 
 
 # ============================================================
@@ -292,250 +341,166 @@ def mettre_a_jour_cache(maintenant):
 
 def obtenir_resultat():
 
-    maintenant = datetime.now(TIMEZONE)
+    # ========================================================
+    # 1. CACHE PARTAGE
+    # ========================================================
 
-    with cache_lock:
+    resultat = lire_cache()
 
-        # ----------------------------------------------------
-        # CACHE D'UN BUS
-        # ----------------------------------------------------
+    if resultat is not None:
 
-        if (
-            cache["heure"] is not None
-            and cache["expiration"] is not None
-        ):
+        return resultat
 
-            if maintenant < cache["expiration"]:
+
+    # ========================================================
+    # 2. CACHE VIDE
+    #
+    # On essaie de prendre le verrou.
+    #
+    # Un seul worker pourra obtenir le verrou.
+    # ========================================================
+
+    lock_obtenu = redis_client.set(
+        LOCK_KEY,
+        "1",
+        nx=True,
+        ex=LOCK_TIMEOUT
+    )
+
+
+    # ========================================================
+    # 3. CE WORKER A LE VERROU
+    # ========================================================
+
+    if lock_obtenu:
+
+        try:
+
+            # ------------------------------------------------
+            # Double vérification du cache
+            #
+            # Important :
+            # un autre worker pouvait avoir rempli Redis
+            # juste avant que nous obtenions le verrou.
+            # ------------------------------------------------
+
+            resultat = lire_cache()
+
+            if resultat is not None:
+                return resultat
+
+
+            # ------------------------------------------------
+            # UNIQUE APPEL TCL
+            # ------------------------------------------------
+
+            resultat = construire_resultat()
+
+
+            # ------------------------------------------------
+            # ERREUR TCL
+            # ------------------------------------------------
+
+            if resultat is None:
+
+                # On regarde s'il existe éventuellement
+                # un ancien résultat conservé.
+                ancien = lire_cache()
+
+                if ancien is not None:
+                    return ancien
 
                 return {
-                    "etat": "bus",
-                    "heure": cache["heure"],
-                    "bus": cache["bus"],
+                    "etat": "erreur",
+                    "heure": None,
+                    "bus": []
                 }
 
-            # Le cache est expiré.
-            cache["heure"] = None
-            cache["bus"] = None
-            cache["expiration"] = None
 
-        # ----------------------------------------------------
-        # CACHE "PAS DE BUS"
-        # ----------------------------------------------------
+            # ------------------------------------------------
+            # STOCKAGE REDIS
+            # ------------------------------------------------
 
-        if (
-            cache["prochaine_requete"] is not None
-            and maintenant < cache["prochaine_requete"]
-        ):
+            ecrire_cache(resultat)
 
-            return {
-                "etat": "aucun_bus",
-                "heure": None,
-                "bus": [],
-            }
+            return resultat
 
-        # ----------------------------------------------------
-        # NOUVELLE INTERROGATION TCL
-        # ----------------------------------------------------
+        finally:
 
-        mettre_a_jour_cache(maintenant)
+            # ------------------------------------------------
+            # LIBERATION DU VERROU
+            # ------------------------------------------------
 
-        # ----------------------------------------------------
-        # RESULTAT
-        # ----------------------------------------------------
-
-        if cache["heure"] is not None:
-
-            return {
-                "etat": "bus",
-                "heure": cache["heure"],
-                "bus": cache["bus"],
-            }
-
-        return {
-            "etat": "aucun_bus",
-            "heure": None,
-            "bus": [],
-        }
+            redis_client.delete(LOCK_KEY)
 
 
-# ============================================================
-# PAGE HTML
-# ============================================================
+    # ========================================================
+    # 4. UN AUTRE WORKER EST EN TRAIN D'APPELER TCL
+    # ========================================================
 
-def generer_page(resultat):
+    # On attend très brièvement que le résultat apparaisse
+    # dans Redis plutôt que de faire nous-mêmes un appel TCL.
 
-    if resultat["etat"] == "bus":
+    for _ in range(20):
 
-        heure = resultat["heure"].strftime("%Hh%M")
+        time.sleep(0.1)
 
-        contenu = f"""
-        <div class="heure">
-            {heure}
-        </div>
-        """
+        resultat = lire_cache()
 
-    else:
+        if resultat is not None:
+            return resultat
 
-        contenu = """
-        <div class="aucun-bus">
-            Pas de bus détecté
-        </div>
-        """
 
-    return f"""
-<!DOCTYPE html>
+    # ========================================================
+    # 5. LE WORKER PRINCIPAL N'A PAS ENCORE FINI
+    # ========================================================
 
-<html lang="fr">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
-
-<title>Ligne 86</title>
-
-<style>
-
-    * {{
-        box-sizing: border-box;
-    }}
-
-    html,
-    body {{
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 100%;
-    }}
-
-    body {{
-        background: #202124;
-        color: white;
-        font-family: Arial, sans-serif;
-
-        display: flex;
-        align-items: center;
-        justify-content: center;
-
-        overflow: hidden;
-    }}
-
-    .conteneur {{
-        text-align: center;
-    }}
-
-    .ligne {{
-        font-size: 20px;
-        color: #ffffff;
-        margin-bottom: 8px;
-        font-weight: bold;
-    }}
-
-    .destination {{
-        font-size: 14px;
-        color: #999999;
-        margin-bottom: 20px;
-    }}
-
-    .heure {{
-        font-size: 72px;
-        line-height: 1;
-        font-weight: bold;
-        color: #55dd88;
-    }}
-
-    .aucun-bus {{
-        font-size: 28px;
-        color: #888888;
-        font-weight: bold;
-    }}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="conteneur">
-
-    <div class="ligne">
-        🚌 Ligne 86
-    </div>
-
-    <div class="destination">
-        {DESTINATION}
-    </div>
-
-    {contenu}
-
-</div>
-
-<script>
-
-    // Actualisation de la page toutes les 60 secondes.
-    //
-    // Attention :
-    // cela ne signifie PAS que l'API TCL est appelée
-    // toutes les 60 secondes.
-    //
-    // C'est le cache Python qui décide s'il faut
-    // réellement interroger TCL.
-
-    setTimeout(function() {{
-        location.reload();
-    }}, 60000);
-
-</script>
-
-</body>
-
-</html>
-"""
+    # On évite absolument de déclencher un deuxième appel TCL.
+    return {
+        "etat": "chargement",
+        "heure": None,
+        "bus": []
+    }
 
 
 # ============================================================
-# ROUTE PRINCIPALE
+# ROUTE API
 # ============================================================
 
 @app.route("/")
-def racine():
-
-    return f"""
-    <html>
-    <head>
-        <meta http-equiv="refresh" content="0; url=/{PAGE_ID}/">
-    </head>
-    <body>
-        <a href="/{PAGE_ID}/">
-            Accéder à la ligne 86
-        </a>
-    </body>
-    </html>
-    """
-
-
-# ============================================================
-# ROUTE /mon-id/
-# ============================================================
-
-@app.route("/<page_id>/")
-def page_bus(page_id):
-
-    # On n'autorise que l'identifiant configuré.
-    if page_id != PAGE_ID:
-        abort(404)
+def accueil():
 
     resultat = obtenir_resultat()
 
-    return generer_page(resultat)
+    return jsonify(resultat)
 
 
 # ============================================================
-# LANCEMENT LOCAL
+# PAGE PRINCIPALE
+# ============================================================
+
+@app.route(f"/{PAGE_ID}/")
+def page():
+
+    resultat = obtenir_resultat()
+
+    return jsonify(resultat)
+
+
+# ============================================================
+# STATISTIQUES
+# ============================================================
+
+@app.route("/stats")
+def stats():
+
+    return jsonify({
+        "nombre_appels_api_worker": nombre_appels_api
+    })
+
+
+# ============================================================
+# DEMARRAGE
 # ============================================================
 
 if __name__ == "__main__":
@@ -544,97 +509,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000))
     )
-
-@app.route("/callapi")
-def callapi():
-
-    return f"""
-    <!DOCTYPE html>
-
-    <html lang="fr">
-
-    <head>
-        <meta charset="UTF-8">
-
-        <meta
-            name="viewport"
-            content="width=device-width, initial-scale=1.0"
-        >
-
-        <title>API TCL - Statistiques</title>
-
-        <style>
-
-            * {{
-                box-sizing: border-box;
-            }}
-
-            html,
-            body {{
-                margin: 0;
-                padding: 0;
-                width: 100%;
-                height: 100%;
-            }}
-
-            body {{
-                background: #202124;
-                color: white;
-                font-family: Arial, sans-serif;
-
-                display: flex;
-                align-items: center;
-                justify-content: center;
-
-                text-align: center;
-            }}
-
-            .conteneur {{
-                padding: 30px;
-            }}
-
-            .titre {{
-                font-size: 22px;
-                color: #999999;
-                margin-bottom: 20px;
-            }}
-
-            .nombre {{
-                font-size: 80px;
-                line-height: 1;
-                font-weight: bold;
-                color: #55dd88;
-            }}
-
-            .texte {{
-                font-size: 18px;
-                margin-top: 15px;
-                color: #ffffff;
-            }}
-
-        </style>
-
-    </head>
-
-    <body>
-
-        <div class="conteneur">
-
-            <div class="titre">
-                API TCL
-            </div>
-
-            <div class="nombre">
-                {nombre_appels_api}
-            </div>
-
-            <div class="texte">
-                appels effectués
-            </div>
-
-        </div>
-
-    </body>
-
-    </html>
-    """
